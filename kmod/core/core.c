@@ -624,15 +624,15 @@ static int kpatch_write_relocations(struct kpatch_module *kpmod,
 		}
 
 		numpages = (PAGE_SIZE - (loc & ~PAGE_MASK) >= size) ? 1 : 2;
-
+#if 0
 		if (readonly)
 			set_memory_rw(loc & PAGE_MASK, numpages);
-
+#endif
 		ret = probe_kernel_write((void *)loc, &val, size);
-
+#if 0
 		if (readonly)
 			set_memory_ro(loc & PAGE_MASK, numpages);
-
+#endif
 		if (ret) {
 			pr_err("write to 0x%llx failed for symbol %s\n",
 			       loc, dynrela->name);
