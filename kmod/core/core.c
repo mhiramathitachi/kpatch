@@ -38,6 +38,7 @@
 #include <linux/slab.h>
 #include <linux/stop_machine.h>
 #include <linux/ftrace.h>
+#include <linux/kprobes.h>
 #include <linux/hashtable.h>
 #include <linux/hardirq.h>
 #include <linux/uaccess.h>
@@ -92,65 +93,59 @@ struct kpatch_kallsyms_args {
 
 
 /*
- * The kpatch core module has a state machine which allows for proper
- * synchronization with kpatch_ftrace_handler() when it runs in NMI context.
+ * The kpatch core module has a function reference counter which allows for
+ * proper synchronization with kpatch_ftrace_handler().
  *
- *         +-----------------------------------------------------+
- *         |                                                     |
- *         |                                                     +
- *         v                                     +---> KPATCH_STATE_SUCCESS
- * KPATCH_STATE_IDLE +---> KPATCH_STATE_UPDATING |
- *         ^                                     +---> KPATCH_STATE_FAILURE
- *         |                                                     +
- *         |                                                     |
- *         +-----------------------------------------------------+
- *
- * KPATCH_STATE_IDLE: No updates are pending.  The func hash is valid, and the
- * reader doesn't need to check func->op.
- *
- * KPATCH_STATE_UPDATING: An update is in progress.  The reader must call
- * kpatch_state_finish(KPATCH_STATE_FAILURE) before accessing the func hash.
- *
- * KPATCH_STATE_FAILURE: An update failed, and the func hash might be
- * inconsistent (pending patched funcs might not have been removed yet).  If
- * func->op is KPATCH_OP_PATCH, then rollback to the previous version of the
- * func.
- *
- * KPATCH_STATE_SUCCESS: An update succeeded, but the func hash might be
- * inconsistent (pending unpatched funcs might not have been removed yet).  If
- * func->op is KPATCH_OP_UNPATCH, then rollback to the previous version of the
- * func.
+ * The kpatch_refcnt starts with KPATCH_REF_START( == 1). At this point,
+ * since all the func_hash entries whose op is KPATCH_OP_PATCH are under
+ * updating, kpatch_ftrace_handler() must use previous entries.
+ * After checking the stack of all tasks, the kpatch_refcnt is decremented
+ * KPATCH_REF_START. If all the target functions are not in use, the refcnt
+ * should be back to 0 (== KPATCH_REF_SUCCESS). Then all new entries are
+ * valid.
  */
 enum {
-	KPATCH_STATE_IDLE,
-	KPATCH_STATE_UPDATING,
-	KPATCH_STATE_SUCCESS,
-	KPATCH_STATE_FAILURE,
+	KPATCH_REF_INIT = 0,
+	KPATCH_REF_START = 1,
+	KPATCH_REF_SUCCESS = 0,
+	KPATCH_REF_FAILURE = 0x1000,
 };
-static atomic_t kpatch_state;
+static atomic_t kpatch_refcnt;
 
-static inline void kpatch_state_idle(void)
+static inline void kpatch_refcnt_init(void)
 {
-	int state = atomic_read(&kpatch_state);
-
-	WARN_ON(state != KPATCH_STATE_SUCCESS && state != KPATCH_STATE_FAILURE);
-	atomic_set(&kpatch_state, KPATCH_STATE_IDLE);
+	atomic_set(&kpatch_refcnt, KPATCH_REF_INIT);
 }
 
-static inline void kpatch_state_updating(void)
+static inline void kpatch_refcnt_start(void)
 {
-	WARN_ON(atomic_read(&kpatch_state) != KPATCH_STATE_IDLE);
-	atomic_set(&kpatch_state, KPATCH_STATE_UPDATING);
+	WARN_ON(atomic_read(&kpatch_refcnt) != KPATCH_REF_INIT);
+	atomic_set(&kpatch_refcnt, KPATCH_REF_START);
 }
 
-/* If state is updating, change it to success or failure and return new state */
-static inline int kpatch_state_finish(int state)
+/* Return 0 if kpatch safety-check get succeeded, otherwides still continuing */
+static inline int kpatch_refcnt_inc(void)
 {
-	int result;
+	return atomic_inc_not_zero(&kpatch_refcnt);
+}
 
-	WARN_ON(state != KPATCH_STATE_SUCCESS && state != KPATCH_STATE_FAILURE);
-	result = atomic_cmpxchg(&kpatch_state, KPATCH_STATE_UPDATING, state);
-	return result == KPATCH_STATE_UPDATING ? state : result;
+static inline int kpatch_refcnt_dec(void)
+{
+	return atomic_dec_if_positive(&kpatch_refcnt);
+}
+
+static inline int kpatch_refcnt_finish(bool success)
+{
+	if (success)
+		atomic_dec(&kpatch_refcnt);
+	else
+		atomic_add(KPATCH_REF_FAILURE, &kpatch_refcnt);
+	return atomic_read(&kpatch_refcnt);
+}
+
+static inline int kpatch_refcnt_read(void)
+{
+	return atomic_read(&kpatch_refcnt);
 }
 
 static struct kpatch_func *kpatch_get_func(unsigned long ip)
@@ -313,35 +308,22 @@ static int kpatch_apply_patch(void *data)
 	struct kpatch_object *object;
 	int ret;
 
-	ret = kpatch_verify_activeness_safety(kpmod);
-	if (ret) {
-		kpatch_state_finish(KPATCH_STATE_FAILURE);
-		return ret;
-	}
-
-	/* tentatively add the new funcs to the global func hash */
+	/* tentatively add the new funcs to the global func hash, but its
+	 * not used until succeeding to verify */
 	do_for_each_linked_func(kpmod, func) {
 		hash_add_rcu(kpatch_func_hash, &func->node, func->old_addr);
 	} while_for_each_linked_func();
 
-	/* memory barrier between func hash add and state change */
+	/* memory barrier between func hash add and refcnt change */
 	smp_wmb();
 
-	/*
-	 * Check if any inconsistent NMI has happened while updating.  If not,
-	 * move to success state.
-	 */
-	ret = kpatch_state_finish(KPATCH_STATE_SUCCESS);
-	if (ret == KPATCH_STATE_FAILURE) {
-		pr_err("NMI activeness safety check failed\n");
+	ret = kpatch_verify_activeness_safety(kpmod);
+	if (ret)
+		goto fail;
 
-		/* Failed, we have to rollback patching process */
-		do_for_each_linked_func(kpmod, func) {
-			hash_del_rcu(&func->node);
-		} while_for_each_linked_func();
-
-		return -EBUSY;
-	}
+	ret = kpatch_refcnt_finish(true);
+	if (ret != 0 && kpatch_refcnt_inc())
+		goto fail;
 
 	/* run any user-defined load hooks */
 	list_for_each_entry(object, &kpmod->objects, list) {
@@ -351,8 +333,15 @@ static int kpatch_apply_patch(void *data)
 			(*hook->hook)();
 	}
 
-
 	return 0;
+fail:
+	/* Failed, we have to rollback patching process */
+	kpatch_refcnt_finish(false);
+	do_for_each_linked_func(kpmod, func) {
+		hash_del_rcu(&func->node);
+	} while_for_each_linked_func();
+
+	return -EBUSY;
 }
 
 /* Called from stop_machine */
@@ -366,14 +355,14 @@ static int kpatch_remove_patch(void *data)
 
 	ret = kpatch_verify_activeness_safety(kpmod);
 	if (ret) {
-		kpatch_state_finish(KPATCH_STATE_FAILURE);
-		return ret;
+fail:
+		kpatch_refcnt_finish(false);
+		return -EBUSY;
 	}
 
-	/* Check if any inconsistent NMI has happened while updating */
-	ret = kpatch_state_finish(KPATCH_STATE_SUCCESS);
-	if (ret == KPATCH_STATE_FAILURE)
-		return -EBUSY;
+	ret = kpatch_refcnt_finish(true);
+	if (ret != 0 && kpatch_refcnt_inc())
+		goto fail;
 
 	/* Succeeded, remove all updating funcs from hash table */
 	do_for_each_linked_func(kpmod, func) {
@@ -404,45 +393,109 @@ kpatch_ftrace_handler(unsigned long ip, unsigned long parent_ip,
 		      struct ftrace_ops *fops, struct pt_regs *regs)
 {
 	struct kpatch_func *func;
-	int state;
+	int refcnt;
 
 	preempt_disable_notrace();
 
-	if (likely(!in_nmi()))
-		func = kpatch_get_func(ip);
-	else {
-		/* Checking for NMI inconsistency */
-		state = kpatch_state_finish(KPATCH_STATE_FAILURE);
+	/* Now we don't need to care about NMI because we can check refcnt */
+	refcnt = kpatch_refcnt_read();
 
-		/* no memory reordering between state and func hash read */
-		smp_rmb();
+	/* no memory reordering between refcnt and func hash read */
+	smp_rmb();
 
-		func = kpatch_get_func(ip);
+	func = kpatch_get_func(ip);
 
-		if (likely(state == KPATCH_STATE_IDLE))
-			goto done;
-
-		if (state == KPATCH_STATE_SUCCESS) {
-			/*
-			 * Patching succeeded.  If the function was being
-			 * unpatched, roll back to the previous version.
-			 */
-			if (func && func->op == KPATCH_OP_UNPATCH)
-				func = kpatch_get_prev_func(func, ip);
-		} else {
-			/*
-			 * Patching failed.  If the function was being patched,
-			 * roll back to the previous version.
-			 */
-			if (func && func->op == KPATCH_OP_PATCH)
-				func = kpatch_get_prev_func(func, ip);
-		}
+	if (refcnt == KPATCH_REF_SUCCESS) {
+		/*
+		 * Patching succeeded.  If the function was being
+		 * unpatched, roll back to the previous version.
+		 */
+		if (func && func->op == KPATCH_OP_UNPATCH)
+			func = kpatch_get_prev_func(func, ip);
+	} else {
+		/*
+		 * Patching failed.  If the function was being patched,
+		 * roll back to the previous version.
+		 */
+		if (func && func->op == KPATCH_OP_PATCH)
+			func = kpatch_get_prev_func(func, ip);
 	}
-done:
+
 	if (func)
 		regs->ip = func->new_addr + MCOUNT_INSN_SIZE;
 
 	preempt_enable_notrace();
+}
+
+/* Update the reference of target function */
+static int kpatch_retprobe_entry(struct kretprobe_instance *rp,
+				   struct pt_regs *regs)
+{
+	kpatch_refcnt_inc();
+	return 0;
+}
+
+static int kpatch_retprobe_return(struct kretprobe_instance *rp,
+				   struct pt_regs *regs)
+{
+	kpatch_refcnt_dec();
+	return 0;
+}
+
+struct kpatch_retprobe {
+	struct list_head list;
+	struct kretprobe rp;
+};
+
+static LIST_HEAD(kpatch_retprobes);
+static int kpatch_nr_retprobes;
+
+static int kpatch_retprobe_add_func(unsigned long ip)
+{
+	struct kpatch_retprobe *krp;
+	int ret;
+
+	krp = kzalloc(sizeof(*krp), GFP_KERNEL);
+	if (!krp)
+		return -ENOMEM;
+
+	krp->rp.entry_handler = kpatch_retprobe_entry;
+	krp->rp.handler = kpatch_retprobe_return;
+	krp->rp.kp.addr = (void *)ip;
+	INIT_LIST_HEAD(&krp->list);
+	ret = register_kretprobe(&krp->rp);
+	if (ret < 0) {
+		kfree(krp);
+		return ret;
+	}
+
+	kpatch_nr_retprobes++;
+	list_add(&krp->list, &kpatch_retprobes);
+
+	return 0;
+}
+
+static int kpatch_retprobe_remove_func(unsigned long ip)
+{
+	struct kpatch_retprobe *krp;
+
+	list_for_each_entry(krp, &kpatch_retprobes, list) {
+		if ((unsigned long)krp->rp.kp.addr != ip)
+			continue;
+		list_del(&krp->list);
+		unregister_kretprobe(&krp->rp);
+		kpatch_nr_retprobes--;
+		return 0;
+	}
+	return -ENOENT;
+}
+
+static void kpatch_retprobe_remove_all(void)
+{
+	struct kpatch_retprobe *krp, *tmp;
+	/* TBD: use unregister_kretprobes */
+	list_for_each_entry_safe(krp, tmp, &kpatch_retprobes, list)
+		kpatch_retprobe_remove_func((unsigned long)krp->rp.kp.addr);
 }
 
 static struct ftrace_ops kpatch_ftrace_ops __read_mostly = {
@@ -458,23 +511,35 @@ static int kpatch_ftrace_add_func(unsigned long ip)
 	if (kpatch_get_func(ip))
 		return 0;
 
+	ret = kpatch_retprobe_add_func(ip);
+	if (ret) {
+		pr_err("can't set kretprobe at address 0x%lx\n", ip);
+		return ret;
+	}
+
 	ret = ftrace_set_filter_ip(&kpatch_ftrace_ops, ip, 0, 0);
 	if (ret) {
 		pr_err("can't set ftrace filter at address 0x%lx\n", ip);
-		return ret;
+		goto out_remove_ret;
 	}
 
 	if (!kpatch_num_patched) {
 		ret = register_ftrace_function(&kpatch_ftrace_ops);
 		if (ret) {
 			pr_err("can't register ftrace handler\n");
-			ftrace_set_filter_ip(&kpatch_ftrace_ops, ip, 1, 0);
-			return ret;
+			goto out_remove_filter;
 		}
 	}
 	kpatch_num_patched++;
 
 	return 0;
+
+out_remove_filter:
+	ftrace_set_filter_ip(&kpatch_ftrace_ops, ip, 1, 0);
+out_remove_ret:
+	kpatch_retprobe_remove_func(ip);
+
+	return ret;
 }
 
 static int kpatch_ftrace_remove_func(unsigned long ip)
@@ -499,6 +564,7 @@ static int kpatch_ftrace_remove_func(unsigned long ip)
 		pr_err("can't remove ftrace filter at address 0x%lx\n", ip);
 		return ret;
 	}
+	kpatch_retprobe_remove_func(ip);
 
 	return 0;
 }
@@ -849,7 +915,16 @@ int kpatch_register(struct kpatch_module *kpmod, bool replace)
 		goto err_list;
 	}
 
+	/* Start the reference counting */
+	kpatch_refcnt_start();
+
+	/* memory barrier between func hash and refcnt write */
+	smp_wmb();
+
 	list_for_each_entry(object, &kpmod->objects, list) {
+		/* Mark all funcs are under patching */
+		list_for_each_entry(func, &object->funcs, list)
+			func->op = KPATCH_OP_PATCH;
 
 		ret = kpatch_link_object(kpmod, object);
 		if (ret) {
@@ -865,25 +940,22 @@ int kpatch_register(struct kpatch_module *kpmod, bool replace)
 
 		if (strcmp(object->name, "vmlinux"))
 			pr_notice("patching module '%s'\n", object->name);
-
-		list_for_each_entry(func, &object->funcs, list)
-			func->op = KPATCH_OP_PATCH;
 	}
 
 	if (replace)
+		/* UNPATCH flag must be set after refcnt starting because
+		 * refcnt initial value is same as success value */
 		hash_for_each_rcu(kpatch_func_hash, i, func, node)
 			func->op = KPATCH_OP_UNPATCH;
-
-	/* memory barrier between func hash and state write */
-	smp_wmb();
-
-	kpatch_state_updating();
 
 	/*
 	 * Idle the CPUs, verify activeness safety, and atomically make the new
 	 * functions visible to the ftrace handler.
 	 */
 	ret = stop_machine(kpatch_apply_patch, kpmod, NULL);
+
+	/* We do not need refcounting anymore */
+	kpatch_retprobe_remove_all();
 
 	/*
 	 * For the replace case, remove any obsolete funcs from the hash and
@@ -921,28 +993,27 @@ int kpatch_register(struct kpatch_module *kpmod, bool replace)
 		}
 	}
 
+	do_for_each_linked_func(kpmod, func) {
+		func->op = KPATCH_OP_NONE;
+	} while_for_each_linked_func();
 
-	/* memory barrier between func hash and state write */
+	/* memory barrier between func hash and refcnt write */
 	smp_wmb();
 
 	/* NMI handlers can return to normal now */
-	kpatch_state_idle();
+	kpatch_refcnt_init();
 
 	/*
 	 * Wait for all existing NMI handlers to complete so that they don't
 	 * see any changes to funcs or funcs->op that might occur after this
 	 * point.
 	 *
-	 * Any NMI handlers starting after this point will see the IDLE state.
+	 * Any handlers starting after this point will see the init refcnt.
 	 */
 	synchronize_rcu();
 
 	if (ret)
 		goto err_ops;
-
-	do_for_each_linked_func(kpmod, func) {
-		func->op = KPATCH_OP_NONE;
-	} while_for_each_linked_func();
 
 	/* TODO: need TAINT_KPATCH */
 	pr_notice_once("tainting kernel with TAINT_USER\n");
@@ -968,6 +1039,11 @@ err_unlink:
 		WARN_ON(kpatch_unlink_object(object));
 	}
 	module_put(kpmod->mod);
+
+	/* memory barrier between func hash and refcnt write */
+	smp_wmb();
+
+	kpatch_refcnt_init();
 err_list:
 	list_del(&kpmod->list);
 err_up:
@@ -989,30 +1065,22 @@ int kpatch_unregister(struct kpatch_module *kpmod)
 	    goto out;
 	}
 
+	/* Start the reference counting */
+	kpatch_refcnt_start();
+
+	/* memory barrier between func hash and state write */
+	smp_wmb();
+
 	do_for_each_linked_func(kpmod, func) {
 		func->op = KPATCH_OP_UNPATCH;
 		if (func->force)
 			force = 1;
 	} while_for_each_linked_func();
 
-	/* memory barrier between func hash and state write */
-	smp_wmb();
-
-	kpatch_state_updating();
-
 	ret = stop_machine(kpatch_remove_patch, kpmod, NULL);
 
 	/* NMI handlers can return to normal now */
-	kpatch_state_idle();
-
-	/*
-	 * Wait for all existing NMI handlers to complete so that they don't
-	 * see any changes to funcs or funcs->op that might occur after this
-	 * point.
-	 *
-	 * Any NMI handlers starting after this point will see the IDLE state.
-	 */
-	synchronize_rcu();
+	kpatch_refcnt_init();
 
 	if (ret) {
 		do_for_each_linked_func(kpmod, func) {
@@ -1020,6 +1088,15 @@ int kpatch_unregister(struct kpatch_module *kpmod)
 		} while_for_each_linked_func();
 		goto out;
 	}
+
+	/*
+	 * Wait for all existing NMI handlers to complete so that they don't
+	 * see any changes to funcs or funcs->op that might occur after this
+	 * point.
+	 *
+	 * Any handlers starting after this point will see the init refcnt.
+	 */
+	synchronize_rcu();
 
 	list_for_each_entry(object, &kpmod->objects, list) {
 		if (!kpatch_object_linked(object))
