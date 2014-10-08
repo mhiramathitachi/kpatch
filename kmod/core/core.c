@@ -36,13 +36,15 @@
 
 #include <linux/module.h>
 #include <linux/slab.h>
-#include <linux/stop_machine.h>
+#include <linux/spinlock.h>
 #include <linux/ftrace.h>
 #include <linux/kprobes.h>
 #include <linux/hashtable.h>
 #include <linux/hardirq.h>
 #include <linux/uaccess.h>
 #include <linux/kallsyms.h>
+#include <linux/smp.h>
+#include <linux/delay.h>
 #include <asm/stacktrace.h>
 #include <asm/cacheflush.h>
 #include "kpatch.h"
@@ -267,6 +269,215 @@ static const struct stacktrace_ops kpatch_print_trace_ops = {
 	.walk_stack	= print_context_stack,
 };
 
+/* Activitiy monitoring task list */
+struct kpatch_montask {
+	struct list_head list;
+	pid_t pid;
+	bool checked;
+	bool failed;
+};
+static LIST_HEAD(kpatch_montasks);
+static LIST_HEAD(kpatch_montask_pool);
+static DEFINE_SPINLOCK(kpatch_montask_lock);
+#define MONTASK_POOL_SIZE	128	/* TODO: this will not fit all */
+
+/* Make an object pool since we can not allocate memory under rcu_read_lock */
+static int kpatch_populate_monitoring_task_pool(int size)
+{
+	struct kpatch_montask *mt;
+	int i;
+
+	for (i = 0; i < size; i++) {
+		mt = kzalloc(sizeof(*mt), GFP_KERNEL);
+		if (!mt)
+			return -ENOMEM;
+		INIT_LIST_HEAD(&mt->list);
+		list_add_tail(&mt->list, &kpatch_montask_pool);
+	}
+	return 0;
+}
+
+/* Cleanup monitoring tasks */
+static void kpatch_cleanup_monitoring_task_pool(void)
+{
+	struct kpatch_montask *mt;
+
+	while (!list_empty(&kpatch_montask_pool)) {
+		mt = list_first_entry(&kpatch_montask_pool,
+				      struct kpatch_montask, list);
+		list_del(&mt->list);
+		kfree(mt);
+	}
+}
+
+static struct kpatch_montask *kpatch_new_monitoring_task_from_pool(void)
+{
+	struct kpatch_montask *mt;
+
+	if (list_empty(&kpatch_montask_pool))
+		return NULL;
+
+	mt = list_first_entry(&kpatch_montask_pool,
+				struct kpatch_montask, list);
+	list_del_init(&mt->list);
+
+	return mt;
+}
+
+static void kpatch_free_monitoring_task_to_pool(struct kpatch_montask *mt)
+{
+	list_add_tail(&mt->list, &kpatch_montask_pool);
+}
+
+static struct kpatch_montask *__kpatch_get_monitoring_task(pid_t pid)
+{
+	struct kpatch_montask *mt;
+
+	list_for_each_entry(mt, &kpatch_montasks, list)
+		if (mt->pid == pid)
+			return mt;
+	return NULL;
+}
+
+static struct kpatch_montask *kpatch_get_monitoring_task(pid_t pid)
+{
+	struct kpatch_montask *mt;
+
+	spin_lock(&kpatch_montask_lock);
+	mt = __kpatch_get_monitoring_task(pid);
+	spin_unlock(&kpatch_montask_lock);
+
+	return mt;
+}
+
+static int
+kpatch_add_monitoring_task(struct task_struct *t, bool checked, bool failed)
+{
+	struct kpatch_montask *mt;
+	int ret = 0;
+
+	spin_lock(&kpatch_montask_lock);
+	mt = __kpatch_get_monitoring_task(t->pid);
+	if (mt) {
+		if (checked && !mt->checked) {
+			mt->checked = checked;
+			mt->failed = failed;
+		}
+	} else {
+		mt = kpatch_new_monitoring_task_from_pool();
+		if (!mt) {
+			ret = -ENOMEM;
+			goto out;
+		}
+		mt->pid = t->pid;
+		mt->checked = checked;
+		mt->failed = failed;
+		INIT_LIST_HEAD(&mt->list);
+		list_add_tail(&mt->list, &kpatch_montasks);
+	}
+out:
+	spin_unlock(&kpatch_montask_lock);
+	return ret;
+}
+
+/* Count the number of unchecked tasks and failed tasks */
+static int kpatch_unchecked_monitoring_tasks(int *failed)
+{
+	struct kpatch_montask *mt;
+	int count = 0;
+
+	spin_lock(&kpatch_montask_lock);
+	list_for_each_entry(mt, &kpatch_montasks, list) {
+		if (!mt->checked)
+			count++;
+		if (mt->failed)
+			(*failed)++;
+	}
+	spin_unlock(&kpatch_montask_lock);
+
+	return count;
+}
+
+static void kpatch_dump_monitoring_tasks(void)
+{
+	struct kpatch_montask *mt;
+
+	spin_lock(&kpatch_montask_lock);
+	list_for_each_entry(mt, &kpatch_montasks, list) {
+		if (!mt->checked || mt->failed)
+			pr_info("PID:%d is %s\n", mt->pid,
+				mt->failed ? "in use" : "not checked");
+	}
+	spin_unlock(&kpatch_montask_lock);
+}
+
+static void kpatch_cleanup_monitoring_tasks(void)
+{
+	struct kpatch_montask *mt;
+
+	spin_lock(&kpatch_montask_lock);
+	while (!list_empty(&kpatch_montasks)) {
+		mt = list_first_entry(&kpatch_montasks,
+				      struct kpatch_montask, list);
+		list_del_init(&mt->list);
+		kpatch_free_monitoring_task_to_pool(mt);
+	}
+	spin_unlock(&kpatch_montask_lock);
+}
+
+static struct kpatch_module *current_kpatch_module;
+
+static void kpatch_montask_check_current(void)
+{
+	struct kpatch_montask *mt;
+	struct kpatch_backtrace_args args = {
+		.kpmod = current_kpatch_module,
+		.ret = 0
+	};
+	int ret;
+
+	if (!current_kpatch_module)
+		return;
+
+	mt = kpatch_get_monitoring_task(current->pid);
+	/* Skip if already checked */
+	if (mt && mt->checked)
+		return;
+
+	pr_debug("Check task PID:%d on %d chk:%d\n", current->pid,
+		 task_cpu(current), mt ? mt->checked : -1);
+	dump_trace(current, NULL, NULL, 0, &kpatch_backtrace_ops, &args);
+	ret = kpatch_add_monitoring_task(current, true, !!args.ret);
+	if (ret < 0) {
+		pr_info("Error: cannot allocate montask\n");
+		spin_lock(&kpatch_montask_lock);
+		mt = list_first_entry(&kpatch_montasks,
+			      struct kpatch_montask, list);
+		mt->failed = true;
+		mt->checked = true;
+		spin_unlock(&kpatch_montask_lock);
+	}
+}
+
+static int kpatch_montask_handler(struct kprobe *kp, struct pt_regs *regs)
+{
+	kpatch_montask_check_current();
+	return 0;
+}
+
+struct kprobe kpatch_ctxsw_probe = {
+	.pre_handler = kpatch_montask_handler,
+	.symbol_name = "__switch_to",
+};
+
+static void unregister_kprobe_init(struct kprobe *kp)
+{
+	unregister_kprobe(kp);
+	if (kp->symbol_name)
+		kp->addr = NULL;
+	kp->flags = 0;
+}
+
 /*
  * Verify activeness safety, i.e. that none of the to-be-patched functions are
  * on the stack of any task.
@@ -277,32 +488,89 @@ static int kpatch_verify_activeness_safety(struct kpatch_module *kpmod)
 {
 	struct task_struct *g, *t;
 	int ret = 0;
+	int failed = 0;
+	int timeout;
 
 	struct kpatch_backtrace_args args = {
 		.kpmod = kpmod,
 		.ret = 0
 	};
 
+	current_kpatch_module = kpmod;
+	smp_rmb();
+	/*
+	 * Hack the task switching here. At this point, online task stack
+	 * checking is started and it could run consequently with off-line
+	 * task stack checking. Since the stack-dump just read through the
+	 * stack entries, there is no race between them.
+	 */
+	ret = register_kprobe(&kpatch_ctxsw_probe);
+	if (ret < 0) {
+		pr_info("Error on registering task switch hook: %d\n", ret);
+		return ret;
+	}
+
 	/* Check the stacks of all tasks. */
+	rcu_read_lock();
+	pr_debug("Current PID: %d\n", current->pid);
 	do_each_thread(g, t) {
+		task_lock(t);
+		if (t != current && t->state == TASK_RUNNING &&
+		    task_cpu(t) != task_cpu(current)) {
+			/* This task is running on other CPUs */
+			pr_debug("Deferred check: PID: %d\n", t->pid);
+			ret = kpatch_add_monitoring_task(t, false, false);
+			task_unlock(t);
+			if (ret)
+				goto unlock;
+			continue;
+		}
 		dump_trace(t, NULL, NULL, 0, &kpatch_backtrace_ops, &args);
 		if (args.ret) {
 			ret = args.ret;
-			pr_info("PID: %d Comm: %.20s\n", t->pid, t->comm);
+			pr_info("PID: %d Comm: %.20s is sleeping on the"\
+				" patched function.\n", t->pid, t->comm);
 			dump_trace(t, NULL, (unsigned long *)t->thread.sp,
 				   0, &kpatch_print_trace_ops, NULL);
-			goto out;
+			task_unlock(t);
+			goto unlock;
 		}
+		task_unlock(t);
 	} while_each_thread(g, t);
 
+unlock:
+	rcu_read_unlock();
+	if (ret)
+		goto out;
+
+	/* Wait for the rest processes on runqueue */
+	timeout = 128;
+	while (kpatch_unchecked_monitoring_tasks(&failed) && failed == 0) {
+		synchronize_sched();
+		if (--timeout == 0) {
+			pr_info("Safeness check timed out\n");
+			kpatch_dump_monitoring_tasks();
+			ret = -ETIME;
+			goto out;
+		}
+	}
+	if (failed) {
+		kpatch_dump_monitoring_tasks();
+		ret = -EBUSY;
+	}
+
 out:
+	/* Cleanup the working area */
+	current_kpatch_module = NULL;
+	unregister_kprobe_init(&kpatch_ctxsw_probe);
+	kpatch_cleanup_monitoring_tasks();
+
 	return ret;
 }
 
 /* Called from stop_machine */
-static int kpatch_apply_patch(void *data)
+static int kpatch_apply_patch(struct kpatch_module *kpmod)
 {
-	struct kpatch_module *kpmod = data;
 	struct kpatch_func *func;
 	struct kpatch_hook *hook;
 	struct kpatch_object *object;
@@ -345,24 +613,23 @@ fail:
 }
 
 /* Called from stop_machine */
-static int kpatch_remove_patch(void *data)
+static int kpatch_remove_patch(struct kpatch_module *kpmod)
 {
-	struct kpatch_module *kpmod = data;
 	struct kpatch_func *func;
 	struct kpatch_hook *hook;
 	struct kpatch_object *object;
 	int ret;
 
 	ret = kpatch_verify_activeness_safety(kpmod);
-	if (ret) {
-fail:
-		kpatch_refcnt_finish(false);
-		return -EBUSY;
-	}
+	if (ret)
+		goto fail;
 
 	ret = kpatch_refcnt_finish(true);
 	if (ret != 0 && kpatch_refcnt_inc())
 		goto fail;
+
+	/* memory barrier between func hash add and refcnt change */
+	smp_wmb();
 
 	/* Succeeded, remove all updating funcs from hash table */
 	do_for_each_linked_func(kpmod, func) {
@@ -378,6 +645,9 @@ fail:
 	}
 
 	return 0;
+fail:
+	kpatch_refcnt_finish(false);
+	return -EBUSY;
 }
 
 /*
@@ -484,6 +754,7 @@ static int kpatch_retprobe_remove_func(unsigned long ip)
 			continue;
 		list_del(&krp->list);
 		unregister_kretprobe(&krp->rp);
+		kfree(krp);
 		kpatch_nr_retprobes--;
 		return 0;
 	}
@@ -952,7 +1223,7 @@ int kpatch_register(struct kpatch_module *kpmod, bool replace)
 	 * Idle the CPUs, verify activeness safety, and atomically make the new
 	 * functions visible to the ftrace handler.
 	 */
-	ret = stop_machine(kpatch_apply_patch, kpmod, NULL);
+	ret = kpatch_apply_patch(kpmod);
 
 	/* We do not need refcounting anymore */
 	kpatch_retprobe_remove_all();
@@ -1002,15 +1273,6 @@ int kpatch_register(struct kpatch_module *kpmod, bool replace)
 
 	/* NMI handlers can return to normal now */
 	kpatch_refcnt_init();
-
-	/*
-	 * Wait for all existing NMI handlers to complete so that they don't
-	 * see any changes to funcs or funcs->op that might occur after this
-	 * point.
-	 *
-	 * Any handlers starting after this point will see the init refcnt.
-	 */
-	synchronize_rcu();
 
 	if (ret)
 		goto err_ops;
@@ -1077,7 +1339,7 @@ int kpatch_unregister(struct kpatch_module *kpmod)
 			force = 1;
 	} while_for_each_linked_func();
 
-	ret = stop_machine(kpatch_remove_patch, kpmod, NULL);
+	ret = kpatch_remove_patch(kpmod);
 
 	/* NMI handlers can return to normal now */
 	kpatch_refcnt_init();
@@ -1135,9 +1397,15 @@ static int kpatch_init(void)
 {
 	int ret;
 
+	ret = kpatch_populate_monitoring_task_pool(MONTASK_POOL_SIZE);
+	if (ret)
+		return ret;
+
 	kpatch_root_kobj = kobject_create_and_add("kpatch", kernel_kobj);
-	if (!kpatch_root_kobj)
-		return -ENOMEM;
+	if (!kpatch_root_kobj) {
+		ret = -ENOMEM;
+		goto err_cleanup;
+	}
 
 	kpatch_patches_kobj = kobject_create_and_add("patches",
 						     kpatch_root_kobj);
@@ -1156,6 +1424,8 @@ err_patches_kobj:
 	kobject_put(kpatch_patches_kobj);
 err_root_kobj:
 	kobject_put(kpatch_root_kobj);
+err_cleanup:
+	kpatch_cleanup_monitoring_task_pool();
 	return ret;
 }
 
@@ -1165,6 +1435,7 @@ static void kpatch_exit(void)
 	WARN_ON(unregister_module_notifier(&kpatch_module_nb));
 	kobject_put(kpatch_patches_kobj);
 	kobject_put(kpatch_root_kobj);
+	kpatch_cleanup_monitoring_task_pool();
 }
 
 module_init(kpatch_init);
